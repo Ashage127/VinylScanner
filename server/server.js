@@ -4280,7 +4280,195 @@ app.post(
     }
   }
 );
+// ======================================================
+// SEARCH DISCOGS PRESSINGS
+// ======================================================
 
+app.post(
+  "/api/search-pressings",
+  async (req, res) => {
+    try {
+      const query = String(
+        req.body?.query || ""
+      ).trim();
+
+      if (!query || query.length < 2) {
+        return res.status(400).json({
+          success: false,
+          error: "Enter an artist or album name.",
+        });
+      }
+
+      const results = await discogsSearch({
+        q: query,
+        perPage: 50,
+      });
+
+      const pressings = results
+        .filter((item) => item.id && item.type === "release")
+        .map((item) => {
+          const parsed = parseDiscogsTitle(
+            item.title || ""
+          );
+
+          return {
+            releaseId: item.id,
+            artist: parsed.artist,
+            album: parsed.album,
+            title: item.title || "",
+            year: item.year || null,
+            country: item.country || null,
+            label: item.label?.[0] || null,
+            catalogNumber: item.catno || null,
+            coverImage:
+              item.cover_image ||
+              item.thumb ||
+              null,
+            discogsUrl:
+              `https://www.discogs.com/release/${item.id}`,
+          };
+        });
+
+      return res.json({
+        success: true,
+        pressings,
+      });
+    } catch (error) {
+      console.error(
+        "PRESSING SEARCH ERROR:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        error:
+          error.message ||
+          "Could not search pressings.",
+      });
+    }
+  }
+);
+// ======================================================
+// EXACT PRESSING BY DISCOGS RELEASE ID
+// ======================================================
+
+app.post("/api/pressing-by-id", async (req, res) => {
+  try {
+    const releaseId = Number(req.body?.releaseId);
+
+    if (
+      !Number.isSafeInteger(releaseId) ||
+      releaseId <= 0
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "A valid Discogs release ID is required.",
+      });
+    }
+
+    // Get the exact Discogs release
+    const discogs = await getDiscogsDetails({
+      id: releaseId,
+    });
+
+    if (!discogs?.artist || !discogs?.album) {
+      return res.status(404).json({
+        success: false,
+        error: "Discogs release not found.",
+      });
+    }
+
+    // Build pressing-specific eBay searches
+    const catalogNumbers = (discogs.catnos || [])
+      .filter(Boolean)
+      .slice(0, 3);
+
+    const barcodes = (discogs.barcodes || [])
+      .map((value) => String(value).replace(/\D/g, ""))
+      .filter(Boolean)
+      .slice(0, 3);
+
+    const queries = uniqueStrings([
+      ...catalogNumbers.map(
+        (catno) =>
+          `${discogs.artist} ${discogs.album} "${catno}" vinyl`
+      ),
+      ...barcodes.map(
+        (barcode) => `${barcode} vinyl`
+      ),
+    ]);
+
+    // No reliable identifiers: don't substitute album price
+    if (!queries.length) {
+      return res.json({
+        ...buildResult(discogs, null),
+        pricing: null,
+        pricingNote:
+          "This release has no catalog number or barcode available for pressing-specific price matching.",
+      });
+    }
+
+    const search = await searchEbaySummaries(
+      discogs.artist,
+      discogs.album,
+      queries
+    );
+
+    const normalizedIdentifiers = [
+      ...catalogNumbers,
+      ...barcodes,
+    ]
+      .map(normalizeIdentifier)
+      .filter(Boolean);
+
+    // Keep only listings that mention an identifier
+    // belonging to the selected release.
+    const matchedListings = search.items.filter((item) => {
+      const searchableText = normalizeIdentifier(
+        [
+          item.title,
+          item.subtitle,
+          item.shortDescription,
+        ]
+          .filter(Boolean)
+          .join(" ")
+      );
+
+      return normalizedIdentifiers.some(
+        (identifier) =>
+          searchableText.includes(identifier)
+      );
+    });
+
+    const pricing = calculatePriceEstimate(
+      matchedListings
+    );
+
+    const response = buildResult(
+      discogs,
+      pricing
+    );
+
+    return res.json({
+      ...response,
+      pricing,
+      pricingNote: pricing
+        ? "Estimate based on eBay US listings matching the selected release identifiers."
+        : "Not enough matching eBay US listings were found to estimate this pressing reliably.",
+      matchingListings: matchedListings.length,
+    });
+  } catch (error) {
+    console.error("PRESSING BY ID ERROR:", error);
+
+    return res.status(500).json({
+      success: false,
+      identified: false,
+      error:
+        error.message ||
+        "Could not load the selected pressing.",
+    });
+  }
+});
 // ======================================================
 // SERVER ERROR
 // ======================================================
